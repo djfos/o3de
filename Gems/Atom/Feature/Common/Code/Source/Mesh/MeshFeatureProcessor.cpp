@@ -22,6 +22,7 @@
 #include <Atom/RPI.Public/Model/ModelTagSystemComponent.h>
 #include <Atom/RPI.Public/RPIUtils.h>
 #include <Atom/RPI.Public/Scene.h>
+#include <Atom/RPI.Reflect/Model/ModelLodAsset.h>
 #include <Mesh/MeshFeatureProcessor.h>
 #include <Mesh/StreamBufferViewsBuilder.h>
 
@@ -49,6 +50,15 @@ namespace AZ
 {
     namespace Render
     {
+        AZ_CVAR(
+            uint32_t,
+            r_meshInstancingTransparentMeshletTriangleCount,
+            64,
+            nullptr,
+            AZ::ConsoleFunctorFlags::Null,
+            "Triangle count per transparent meshlet used by mesh instancing sorting."
+            " Values <= 1 disable transparent meshlet splitting.");
+
         static AZ::Name s_o_meshUseForwardPassIBLSpecular_Name =
             AZ::Name::FromStringLiteral("o_meshUseForwardPassIBLSpecular", AZ::Interface<AZ::NameDictionary>::Get());
         static AZ::Name s_m_rootConstantInstanceDataOffset_Name =
@@ -80,6 +90,101 @@ namespace AZ
                     meshInstanceGroupData.m_drawRootConstantOffset = interval.m_min;
                 }
             }
+        }
+
+        template<typename IndexType>
+        static void BuildTransparentMeshletsFromTypedIndices(
+            const AZStd::span<const IndexType>& indices,
+            const AZStd::span<const AZ::Vector3>& positions,
+            uint32_t runtimeIndexOffset,
+            uint32_t indexCount,
+            uint32_t trianglesPerMeshlet,
+            AZStd::vector<MeshInstanceGroupData::TransparentMeshlet>& meshlets)
+        {
+            if (indices.empty() || positions.empty() || indexCount < 3)
+            {
+                return;
+            }
+
+            const uint32_t maxIndexCount = AZStd::min(indexCount, static_cast<uint32_t>(indices.size()));
+            const uint32_t indicesPerMeshlet = AZStd::max(trianglesPerMeshlet, 1u) * 3;
+            for (uint32_t localIndexOffset = 0; localIndexOffset < maxIndexCount; localIndexOffset += indicesPerMeshlet)
+            {
+                const uint32_t meshletIndexCount = AZStd::min(indicesPerMeshlet, maxIndexCount - localIndexOffset);
+                Aabb localBounds = Aabb::CreateNull();
+
+                for (uint32_t index = localIndexOffset; index < localIndexOffset + meshletIndexCount; ++index)
+                {
+                    const uint32_t vertexIndex = static_cast<uint32_t>(indices[index]);
+                    if (vertexIndex < positions.size())
+                    {
+                        localBounds.AddPoint(positions[vertexIndex]);
+                    }
+                }
+
+                if (!localBounds.IsValid())
+                {
+                    continue;
+                }
+
+                MeshInstanceGroupData::TransparentMeshlet meshlet;
+                meshlet.m_indexOffset = runtimeIndexOffset + localIndexOffset;
+                meshlet.m_indexCount = meshletIndexCount;
+                meshlet.m_localCenter = localBounds.GetCenter();
+                meshlets.push_back(meshlet);
+            }
+        }
+
+        static AZStd::vector<MeshInstanceGroupData::TransparentMeshlet> BuildTransparentMeshlets(
+            const RPI::ModelLodAsset::Mesh& meshAsset,
+            const RPI::ModelLod::Mesh& runtimeMesh)
+        {
+            AZStd::vector<MeshInstanceGroupData::TransparentMeshlet> meshlets;
+            const auto& drawArguments = runtimeMesh.GetDrawArguments().m_indexed;
+            if (drawArguments.m_indexCount < 3 || r_meshInstancingTransparentMeshletTriangleCount <= 1)
+            {
+                return meshlets;
+            }
+
+            static const AZ::Name positionSemantic = AZ::Name("POSITION");
+            const AZStd::span<const AZ::Vector3> positions = meshAsset.GetSemanticBufferTyped<AZ::Vector3>(positionSemantic);
+            if (positions.empty())
+            {
+                return meshlets;
+            }
+
+            const auto& bufferDesc = meshAsset.GetIndexBufferAssetView().GetBufferViewDescriptor();
+            switch (bufferDesc.m_elementFormat)
+            {
+            case RHI::Format::R16_UINT:
+            {
+                const AZStd::span<const uint16_t> indices = meshAsset.GetIndexBufferTyped<uint16_t>();
+                BuildTransparentMeshletsFromTypedIndices(
+                    indices,
+                    positions,
+                    drawArguments.m_indexOffset,
+                    drawArguments.m_indexCount,
+                    r_meshInstancingTransparentMeshletTriangleCount,
+                    meshlets);
+                break;
+            }
+            case RHI::Format::R32_UINT:
+            {
+                const AZStd::span<const uint32_t> indices = meshAsset.GetIndexBufferTyped<uint32_t>();
+                BuildTransparentMeshletsFromTypedIndices(
+                    indices,
+                    positions,
+                    drawArguments.m_indexOffset,
+                    drawArguments.m_indexCount,
+                    r_meshInstancingTransparentMeshletTriangleCount,
+                    meshlets);
+                break;
+            }
+            default:
+                break;
+            }
+
+            return meshlets;
         }
 
         void MeshFeatureProcessor::Reflect(ReflectContext* context)
@@ -539,6 +644,22 @@ namespace AZ
                 }
             }
 
+            if (m_perViewTransparentMeshletDrawPackets.size() <= viewCount)
+            {
+                m_perViewTransparentMeshletDrawPackets.resize(viewCount, AZStd::vector<RHI::Ptr<RHI::DrawPacket>>());
+            }
+
+            if (m_perViewTransparentMeshletGeometryViews.size() <= viewCount)
+            {
+                m_perViewTransparentMeshletGeometryViews.resize(viewCount, AZStd::vector<RHI::GeometryView>());
+            }
+
+            for (size_t viewIndex = 0; viewIndex < viewCount; ++viewIndex)
+            {
+                m_perViewTransparentMeshletDrawPackets[viewIndex].clear();
+                m_perViewTransparentMeshletGeometryViews[viewIndex].clear();
+            }
+
             AZStd::vector<uint32_t> perBucketInstanceCounts;
             const auto instanceManagerRanges = m_meshInstanceManager.GetParallelRanges();
             if (instanceManagerRanges.size() > 0)
@@ -579,7 +700,11 @@ namespace AZ
                 {
                     // Resize the cloned draw packet vector so that there is a unique drawItem for each view
                     instanceGroupDataIter->m_perViewDrawPackets.resize(viewCount);
-                    maxPossibleInstanceCountForGroup += instanceGroupDataIter->m_count;
+                    const uint32_t meshletMultiplier =
+                        instanceGroupDataIter->m_isTransparent && !instanceGroupDataIter->m_transparentMeshlets.empty()
+                        ? static_cast<uint32_t>(instanceGroupDataIter->m_transparentMeshlets.size())
+                        : 1;
+                    maxPossibleInstanceCountForGroup += instanceGroupDataIter->m_count * meshletMultiplier;
                 }
                 perBucketInstanceCounts[iteratorRange.m_begin.GetPageIndex()] = maxPossibleInstanceCountForGroup;
             }
@@ -652,6 +777,8 @@ namespace AZ
                         [this, viewPtr = view.get(), viewIndex, batchStart, currentBatchCount]()
                         {
                             RPI::VisibleObjectListView visibilityList = viewPtr->GetVisibleObjectList();
+                            const Vector3 cameraPosition = viewPtr->GetViewToWorldMatrix().GetTranslation();
+                            const Vector3 viewForward = -viewPtr->GetViewToWorldMatrix().GetBasisZAsVector3();
                             AZStd::vector<InstanceGroupBucket>& currentViewInstanceGroupBuckets = m_perViewInstanceGroupBuckets[viewIndex];
                             for (size_t i = batchStart; i < batchStart + currentBatchCount; ++i)
                             {
@@ -661,23 +788,55 @@ namespace AZ
 
                                 for (const ModelDataInstance::PostCullingInstanceData& postCullingData : *postCullingInstanceDataList)
                                 {
-                                    SortInstanceData instanceData;
-                                    instanceData.m_instanceGroupHandle = postCullingData.m_instanceGroupHandle;
-                                    instanceData.m_objectId = postCullingData.m_objectId;
-                                    instanceData.m_depth = visibleObject.m_depth;
-
-                                    // Sort transparent objects in reverse by making their depths negative.
-                                    if (instanceData.m_instanceGroupHandle->m_isTransparent)
-                                    {
-                                        instanceData.m_depth *= -1.0f;
-                                    }
-
-                                    // Add the sort data to the bucket
                                     InstanceGroupBucket& instanceGroupBucket =
                                         currentViewInstanceGroupBuckets[postCullingData.m_instanceGroupPageIndex];
-                                    // Use an atomic operation to determine where to insert this sort data
-                                    uint32_t currentIndex = instanceGroupBucket.m_currentElementIndex++;
-                                    instanceGroupBucket.m_sortInstanceData[currentIndex] = instanceData;
+                                    ModelDataInstance::InstanceGroupHandle instanceGroupHandle = postCullingData.m_instanceGroupHandle;
+
+                                    if (instanceGroupHandle->m_isTransparent && !instanceGroupHandle->m_transparentMeshlets.empty())
+                                    {
+                                        const Transform transform = m_transformService->GetTransformForId(postCullingData.m_objectId);
+                                        const Vector3 nonUniformScale = m_transformService->GetNonUniformScaleForId(postCullingData.m_objectId);
+
+                                        for (uint32_t meshletIndex = 0; meshletIndex < instanceGroupHandle->m_transparentMeshlets.size(); ++meshletIndex)
+                                        {
+                                            const MeshInstanceGroupData::TransparentMeshlet& meshlet = instanceGroupHandle->m_transparentMeshlets[meshletIndex];
+                                            SortInstanceData instanceData;
+                                            instanceData.m_instanceGroupHandle = instanceGroupHandle;
+                                            instanceData.m_meshletIndex = meshletIndex;
+                                            instanceData.m_objectId = postCullingData.m_objectId;
+
+                                            Vector3 scaledCenter = meshlet.m_localCenter;
+                                            scaledCenter.SetX(scaledCenter.GetX() * nonUniformScale.GetX());
+                                            scaledCenter.SetY(scaledCenter.GetY() * nonUniformScale.GetY());
+                                            scaledCenter.SetZ(scaledCenter.GetZ() * nonUniformScale.GetZ());
+                                            const Vector3 worldCenter = transform.TransformPoint(scaledCenter);
+                                            const Vector3 cameraToMeshlet = worldCenter - cameraPosition;
+
+                                            // Reverse sort transparent geometry by negating view depth.
+                                            instanceData.m_depth = -cameraToMeshlet.Dot(viewForward);
+
+                                            // Use an atomic operation to determine where to insert this sort data.
+                                            uint32_t currentIndex = instanceGroupBucket.m_currentElementIndex++;
+                                            instanceGroupBucket.m_sortInstanceData[currentIndex] = instanceData;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        SortInstanceData instanceData;
+                                        instanceData.m_instanceGroupHandle = instanceGroupHandle;
+                                        instanceData.m_objectId = postCullingData.m_objectId;
+                                        instanceData.m_depth = visibleObject.m_depth;
+
+                                        // Sort transparent objects in reverse by making their depths negative.
+                                        if (instanceData.m_instanceGroupHandle->m_isTransparent)
+                                        {
+                                            instanceData.m_depth *= -1.0f;
+                                        }
+
+                                        // Use an atomic operation to determine where to insert this sort data.
+                                        uint32_t currentIndex = instanceGroupBucket.m_currentElementIndex++;
+                                        instanceGroupBucket.m_sortInstanceData[currentIndex] = instanceData;
+                                    }
                                 }
                             }
                         });
@@ -723,9 +882,16 @@ namespace AZ
             ModelDataInstance::InstanceGroupHandle instanceGroupHandle,
             float accumulatedDepth,
             uint32_t instanceGroupBeginIndex,
-            uint32_t instanceGroupEndNonInclusiveIndex)
+            uint32_t instanceGroupEndNonInclusiveIndex,
+            uint32_t meshletIndex,
+            AZStd::vector<RHI::Ptr<RHI::DrawPacket>>& transientMeshletDrawPackets,
+            AZStd::vector<RHI::GeometryView>& transientMeshletGeometryViews)
         {
             MeshInstanceGroupData& instanceGroup = *instanceGroupHandle;
+
+            const bool useMeshletGeometry =
+                instanceGroup.m_isTransparent && !instanceGroup.m_transparentMeshlets.empty() &&
+                meshletIndex < instanceGroup.m_transparentMeshlets.size();
 
             // Each task is working on a page of instance groups, but
             // there is also one task per-view. So there may be multiple
@@ -738,17 +904,45 @@ namespace AZ
                 instanceGroup.m_perViewDrawPackets.resize(viewIndex + 1);
             }
 
-            // Cache a cloned drawpacket here
-            if (!instanceGroup.m_perViewDrawPackets[viewIndex])
+            RHI::Ptr<RHI::DrawPacket> clonedDrawPacket;
+            if (useMeshletGeometry)
             {
-                // Since there is only one task that will operate both on this view index and on the bucket with this instance group,
-                // there is no need to lock here.
+                // Meshlet draws need unique geometry ranges, so keep one transient cloned packet per submitted meshlet draw.
                 RHI::DrawPacketBuilder drawPacketBuilder{RHI::MultiDevice::AllDevices};
-                instanceGroup.m_perViewDrawPackets[viewIndex] = drawPacketBuilder.Clone(instanceGroup.m_drawPacket.GetRHIDrawPacket());
-            }
+                clonedDrawPacket = drawPacketBuilder.Clone(instanceGroup.m_drawPacket.GetRHIDrawPacket());
+                transientMeshletDrawPackets.push_back(clonedDrawPacket);
 
-            // Now that we have a valid cloned draw packet, update it with the latest offset + count
-            RHI::Ptr<RHI::DrawPacket> clonedDrawPacket = instanceGroup.m_perViewDrawPackets[viewIndex];
+                const auto& meshlet = instanceGroup.m_transparentMeshlets[meshletIndex];
+                const auto& mesh = instanceGroup.m_drawPacket.GetMesh();
+                transientMeshletGeometryViews.push_back(mesh);
+                RHI::GeometryView& meshletGeometry = transientMeshletGeometryViews.back();
+
+                const RHI::DrawIndexed& sourceDrawArgs = mesh.GetDrawArguments().m_indexed;
+                meshletGeometry.SetDrawArguments(
+                    RHI::DrawIndexed(sourceDrawArgs.m_vertexOffset, meshlet.m_indexCount, meshlet.m_indexOffset));
+
+                for (size_t drawItemIndex = 0; drawItemIndex < clonedDrawPacket->GetDrawItemCount(); ++drawItemIndex)
+                {
+                    RHI::DrawItem* drawItem = clonedDrawPacket->GetDrawItem(drawItemIndex);
+                    if (drawItem && drawItem->GetPipelineStateType() == RHI::PipelineStateType::Draw)
+                    {
+                        drawItem->SetGeometryView(&meshletGeometry);
+                    }
+                }
+            }
+            else
+            {
+                // Cache a cloned drawpacket here
+                if (!instanceGroup.m_perViewDrawPackets[viewIndex])
+                {
+                    // Since there is only one task that will operate both on this view index and on the bucket with this instance group,
+                    // there is no need to lock here.
+                    RHI::DrawPacketBuilder drawPacketBuilder{RHI::MultiDevice::AllDevices};
+                    instanceGroup.m_perViewDrawPackets[viewIndex] = drawPacketBuilder.Clone(instanceGroup.m_drawPacket.GetRHIDrawPacket());
+                }
+
+                clonedDrawPacket = instanceGroup.m_perViewDrawPackets[viewIndex];
+            }
 
             // Set the instance data offset
             AZStd::span<uint8_t> data{ reinterpret_cast<uint8_t*>(&instanceGroupBeginIndex), sizeof(uint32_t) };
@@ -791,36 +985,58 @@ namespace AZ
                         [currentBatchStart,
                         viewIndex,
                         &view,
-                        &perViewInstanceData, &instanceGroupBucket]()
+                        &perViewInstanceData,
+                        &instanceGroupBucket,
+                        &transientMeshletDrawPackets = m_perViewTransparentMeshletDrawPackets[viewIndex],
+                        &transientMeshletGeometryViews = m_perViewTransparentMeshletGeometryViews[viewIndex]]()
                         {
                             ModelDataInstance::InstanceGroupHandle currentInstanceGroup =
                                 instanceGroupBucket.m_sortInstanceData.begin()->m_instanceGroupHandle;
+                            uint32_t currentMeshletIndex = instanceGroupBucket.m_sortInstanceData.begin()->m_meshletIndex;
                             uint32_t instanceDataOffset = currentBatchStart;
                             float accumulatedDepth = 0.0f;
                             uint32_t instanceDataIndex = currentBatchStart;
+
+                            auto submitCurrentRange =
+                                [&]()
+                            {
+                                if (instanceDataIndex > instanceDataOffset)
+                                {
+                                    AddInstancedDrawPacketToView(
+                                        view,
+                                        viewIndex,
+                                        currentInstanceGroup,
+                                        accumulatedDepth,
+                                        instanceDataOffset,
+                                        instanceDataIndex,
+                                        currentMeshletIndex,
+                                        transientMeshletDrawPackets,
+                                        transientMeshletGeometryViews);
+                                }
+                            };
+
                             for (SortInstanceData& sortInstanceData : instanceGroupBucket.m_sortInstanceData)
                             {
                                 // Anytime the instance group changes, submit a draw for the previous group
-                                if (sortInstanceData.m_instanceGroupHandle != currentInstanceGroup)
+                                if (sortInstanceData.m_instanceGroupHandle != currentInstanceGroup ||
+                                    sortInstanceData.m_meshletIndex != currentMeshletIndex)
                                 {
-                                    AddInstancedDrawPacketToView(
-                                        view, viewIndex, currentInstanceGroup, accumulatedDepth, instanceDataOffset, instanceDataIndex);
+                                    submitCurrentRange();
 
                                     // Update the loop trackers
                                     accumulatedDepth = 0.0f;
                                     instanceDataOffset = instanceDataIndex;
                                     currentInstanceGroup = sortInstanceData.m_instanceGroupHandle;
+                                    currentMeshletIndex = sortInstanceData.m_meshletIndex;
                                 }
+
                                 perViewInstanceData[instanceDataIndex] = sortInstanceData.m_objectId;
                                 accumulatedDepth += sortInstanceData.m_depth;
                                 instanceDataIndex++;
                             }
 
                             // Submit the last instance group
-                            {
-                                AddInstancedDrawPacketToView(
-                                    view, viewIndex, currentInstanceGroup, accumulatedDepth, instanceDataOffset, instanceDataIndex);
-                            }
+                            submitCurrentRange();
                         });
 
                     // At this point, inserting into the bucket is already complete, so m_currentElementIndex represents the count of all visible meshes in this bucket.
@@ -2440,6 +2656,22 @@ namespace AZ
                         MeshInstanceGroupData& instanceGroupData = meshInstanceManager[instanceGroupInsertResult.m_handle];
                         instanceGroupData.m_drawPacket = AZStd::move(drawPacket);
                         instanceGroupData.m_isDrawMotion = m_flags.m_isDrawMotion;
+                        instanceGroupData.m_transparentMeshlets.clear();
+
+                        if (instancingSupport.m_isTransparent)
+                        {
+                            const auto& lodAssets = m_model->GetModelAsset()->GetLodAssets();
+                            if (modelLodIndex < lodAssets.size())
+                            {
+                                const Data::Asset<RPI::ModelLodAsset>& lodAsset = lodAssets[modelLodIndex];
+                                if (lodAsset && meshIndex < lodAsset->GetMeshes().size())
+                                {
+                                    instanceGroupData.m_transparentMeshlets = BuildTransparentMeshlets(
+                                        lodAsset->GetMeshes()[meshIndex],
+                                        instanceGroupData.m_drawPacket.GetMesh());
+                                }
+                            }
+                        }
 
                         // We're going to need an interval for the root constant data that we update every frame for each draw item, so cache that here
                         CacheRootConstantInterval(instanceGroupData);

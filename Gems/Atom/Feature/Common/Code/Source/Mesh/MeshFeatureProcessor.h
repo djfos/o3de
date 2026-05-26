@@ -13,6 +13,7 @@
 #include <Atom/Feature/Mesh/MeshFeatureProcessorInterface.h>
 #include <Atom/Feature/Mesh/MeshInfo.h>
 #include <Atom/Feature/Mesh/ModelReloaderSystemInterface.h>
+#include <Atom/RHI/GeometryView.h>
 #include <Atom/RHI/TagBitRegistry.h>
 #include <Atom/RPI.Public/Culling.h>
 #include <Atom/RPI.Public/MeshDrawPacket.h>
@@ -371,12 +372,14 @@ namespace AZ
             struct SortInstanceData
             {
                 ModelDataInstance::InstanceGroupHandle m_instanceGroupHandle;
+                uint32_t m_meshletIndex = 0;
                 float m_depth = 0.0f;
                 TransformServiceFeatureProcessorInterface::ObjectId m_objectId;
 
                 bool operator<(const SortInstanceData& rhs) const
                 {
-                    return AZStd::tie(m_instanceGroupHandle, m_depth) < AZStd::tie(rhs.m_instanceGroupHandle, rhs.m_depth);
+                    return AZStd::tie(m_instanceGroupHandle, m_meshletIndex, m_depth) <
+                        AZStd::tie(rhs.m_instanceGroupHandle, rhs.m_meshletIndex, rhs.m_depth);
                 }
             };
 
@@ -407,6 +410,8 @@ namespace AZ
             AZStd::vector<AZStd::vector<InstanceGroupBucket>> m_perViewInstanceGroupBuckets;
             AZStd::vector<AZStd::vector<TransformServiceFeatureProcessorInterface::ObjectId>> m_perViewInstanceData;
             AZStd::vector<GpuBufferHandler> m_perViewInstanceDataBufferHandlers;
+            AZStd::vector<AZStd::vector<RHI::Ptr<RHI::DrawPacket>>> m_perViewTransparentMeshletDrawPackets;
+            AZStd::vector<AZStd::vector<RHI::GeometryView>> m_perViewTransparentMeshletGeometryViews;
             
             TransformServiceFeatureProcessor* m_transformService = nullptr;
             RayTracingFeatureProcessor* m_rayTracingFeatureProcessor = nullptr;

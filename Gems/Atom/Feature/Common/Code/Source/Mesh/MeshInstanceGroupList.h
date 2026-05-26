@@ -13,6 +13,7 @@
 #include <Atom/RPI.Public/MeshDrawPacket.h>
 #include <Atom/Utils/StableDynamicArray.h>
 #include <AtomCore/std/parallel/concurrency_checker.h>
+#include <AzCore/Math/Vector3.h>
 #include <AzCore/std/containers/vector.h>
 #include <AzCore/std/containers/unordered_map.h>
 
@@ -24,6 +25,13 @@ namespace AZ::Render
     //! with a single instanced draw call
     struct MeshInstanceGroupData
     {
+        struct TransparentMeshlet
+        {
+            uint32_t m_indexOffset = 0;
+            uint32_t m_indexCount = 0;
+            AZ::Vector3 m_localCenter = AZ::Vector3::CreateZero();
+        };
+
         // The original draw packet, shared by every instance
         RPI::MeshDrawPacket m_drawPacket;
 
@@ -55,6 +63,9 @@ namespace AZ::Render
 
         // If the group is transparent, sort depth in reverse
         bool m_isTransparent = false;
+
+        // Optional geometry split for transparent meshes. Each entry defines one meshlet draw range and a local-space center.
+        AZStd::vector<TransparentMeshlet> m_transparentMeshlets;
 
         // For per-mesh shader options
         // If all the ModelDataInstances within this group are using the same shader option value, then we can apply the mesh shader options to the draw packet.
